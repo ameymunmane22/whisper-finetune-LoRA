@@ -1,0 +1,437 @@
+import copy
+import io
+import os
+from dataclasses import asdict
+from functools import partial
+from typing import Callable, Iterator, Optional, Union
+
+import torch
+import torch.nn.functional as F
+import torchaudio.transforms as T
+from torch import Tensor
+from torch.utils.checkpoint import checkpoint
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from whisper import _ALIGNMENT_HEADS, _MODELS, _download, available_models
+from whisper.model import AudioEncoder, TextDecoder, Whisper
+from whisper.tokenizer import get_tokenizer
+
+from whisper_finetune.eval.utils import VOCAB_SPECS, normalize_text
+import whisper_finetune.runtime as rt
+
+
+def train_step(
+    model: Whisper,
+    train_iter: Iterator,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.LambdaLR,
+    t_config: dict,
+    lora_tracker=None,
+    step: int = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+) -> float:
+    model.train()
+    total_loss = 0.0
+
+    # Read variables from t_config
+    mixed_precision_training = t_config["mixed_precision_training"]
+    accum_grad_steps = t_config["accum_grad_steps"]
+    max_grad_norm = t_config["max_grad_norm"]
+    mp_dtype = torch.float16 if t_config["mp_dtype"] == "fp16" else torch.bfloat16
+    label_smoothing = t_config.get("label_smoothing", 0.0)  # Label smoothing for cross-entropy
+    is_lora_run = t_config.get("is_lora_run", False)
+
+    use_fp16 = mixed_precision_training and t_config["mp_dtype"] == "fp16"
+    if use_fp16 and scaler is None:
+        raise ValueError("fp16 mixed precision training requires a persistent GradScaler.")
+    if not use_fp16:
+        scaler = None  # No scaler for bf16 or fp32.
+
+    max_retries = 3  # Set the maximum number of retries for a training step
+
+    device = next(model.parameters()).device
+
+    for accum_idx in range(accum_grad_steps):
+        is_accum_last = accum_idx == accum_grad_steps - 1
+        retry_count = 0
+        while retry_count < max_retries:
+            try:  # Illegal memory access happens sometimes.
+                x, y_in, y_out = next(train_iter)
+                x = x.to(device, non_blocking=True)
+                y_in = y_in.to(device, non_blocking=True)
+                y_out = y_out.to(device, non_blocking=True)
+                with rt.maybe_no_sync(model, enabled=rt.IS_DISTRIBUTED and not is_accum_last):
+                    with torch.autocast(device_type="cuda", enabled=mixed_precision_training, dtype=mp_dtype):
+                        logits = model(x, y_in)
+                        loss = F.cross_entropy(logits.transpose(1, 2), y_out, label_smoothing=label_smoothing)
+
+                        loss = loss / accum_grad_steps
+                    if scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+                total_loss += loss.item()
+                break  # Exit retry loop if no error occurs
+            except RuntimeError as e:
+                if "CUDA error: an illegal memory" in str(e):
+                    if rt.IS_DISTRIBUTED:
+                        print("Caught illegal memory access under DDP; aborting instead of retrying.")
+                        raise
+                    print(f"Caught illegal memory access, retry {retry_count + 1}")
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        print("Max retries reached. Something is wrong.")
+                        raise
+                else:
+                    raise
+
+    if scaler:
+        # Unscales the gradients of optimizer's assigned params in-place
+        scaler.unscale_(optimizer)
+
+    # Log LoRA debug info AFTER backward() but BEFORE optimizer.step()
+    # This captures gradient information before gradients are zeroed
+    # Only log at eval steps (when step is provided and is an eval step)
+    val_steps = t_config.get("val_steps", None)
+    train_steps = t_config.get("train_steps", None)
+    should_log_lora = (
+        is_lora_run and 
+        step is not None and 
+        val_steps is not None and 
+        ((step % val_steps == 0) or step == train_steps)
+    )
+    if should_log_lora:
+        from whisper_finetune.model.lora import log_lora_debug_info
+        log_lora_debug_info(rt.unwrap_model(model), step=step, tracker=lora_tracker, log_to_wandb=rt.IS_MAIN)
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+    # Take snapshot of LoRA params BEFORE optimizer.step() to track updates
+    if is_lora_run and lora_tracker is not None:
+        lora_tracker.snapshot()
+
+    if scaler:
+        # Step scheduler only if optimizer.step actually happened (i.e., no overflow skip).
+        scale_before = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        scale_after = scaler.get_scale()
+        if scale_after >= scale_before:
+            lr_scheduler.step()
+    else:
+        optimizer.step()
+        lr_scheduler.step()
+
+    optimizer.zero_grad(set_to_none=True)
+
+    return total_loss
+
+
+def save_model(model: Whisper, save_path: str) -> None:
+    model = rt.unwrap_model(model)
+    # save model in half precision to save space
+    model = copy.deepcopy(model).half()
+    # save model weights and config in a dictionary that can be loaded with `whisper.load_model`
+    torch.save({"model_state_dict": model.state_dict(), "dims": asdict(model.dims)}, save_path)
+
+
+def _resample_block_list(blocks: torch.nn.ModuleList, target_layers: int) -> torch.nn.ModuleList:
+    """Resize a block list by deterministic proportional keep/duplicate."""
+    if target_layers < 1:
+        raise ValueError(f"target_layers must be >= 1, got {target_layers}")
+
+    current_layers = len(blocks)
+    if current_layers < 1:
+        raise ValueError("Cannot resize an empty block list")
+
+    if target_layers == current_layers:
+        return blocks
+
+    resized_blocks = []
+    for i, block in enumerate(blocks):
+        # Proportional resampling:
+        # - repeat=0: drop block
+        # - repeat=1: keep block
+        # - repeat>1: keep + deep-copied duplicates
+        repeat = ((i + 1) * target_layers) // current_layers - (i * target_layers) // current_layers
+        if repeat <= 0:
+            continue
+        resized_blocks.append(block)
+        for _ in range(repeat - 1):
+            resized_blocks.append(copy.deepcopy(block))
+
+    if len(resized_blocks) != target_layers:
+        raise RuntimeError(
+            f"Layer resizing produced {len(resized_blocks)} blocks, expected {target_layers}."
+        )
+
+    return torch.nn.ModuleList(resized_blocks)
+
+
+def _reset_default_alignment_heads(model: Whisper) -> None:
+    all_heads = torch.zeros(model.dims.n_text_layer, model.dims.n_text_head, dtype=torch.bool)
+    all_heads[model.dims.n_text_layer // 2 :] = True
+    model.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
+
+
+def resize_whisper_layers(
+    model: Whisper,
+    target_encoder_layers: Optional[int] = None,
+    target_decoder_layers: Optional[int] = None,
+) -> bool:
+    """Resize Whisper encoder/decoder depth before training.
+
+    Returns:
+        bool: True if architecture changed, otherwise False.
+    """
+    architecture_changed = False
+
+    if target_encoder_layers is not None:
+        current_encoder_layers = len(model.encoder.blocks)
+        if target_encoder_layers != current_encoder_layers:
+            model.encoder.blocks = _resample_block_list(model.encoder.blocks, target_encoder_layers)
+            model.dims.n_audio_layer = target_encoder_layers
+            architecture_changed = True
+            print(f"Resized encoder layers: {current_encoder_layers} -> {target_encoder_layers}")
+
+    if target_decoder_layers is not None:
+        current_decoder_layers = len(model.decoder.blocks)
+        if target_decoder_layers != current_decoder_layers:
+            model.decoder.blocks = _resample_block_list(model.decoder.blocks, target_decoder_layers)
+            model.dims.n_text_layer = target_decoder_layers
+            _reset_default_alignment_heads(model)
+            architecture_changed = True
+            print(f"Resized decoder layers: {current_decoder_layers} -> {target_decoder_layers}")
+
+    return architecture_changed
+
+
+def infinite_iter(data_loader: DataLoader) -> Iterator:
+    epoch = 0
+    while True:
+        sampler = getattr(data_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        for batch in data_loader:
+            yield batch
+        epoch += 1
+
+
+class StochasticDepthMixin:
+    """
+    Mixin class providing stochastic depth functionality with gradient checkpointing.
+    See: https://arxiv.org/abs/1603.09382
+    """
+
+    def stochastic_depth(self, x: Tensor, layer: Callable[[Tensor], Tensor], p: float) -> Tensor:
+        """
+        Apply stochastic depth: randomly skip a layer during training with probability p.
+        Uses gradient checkpointing to save memory.
+
+        Args:
+            x: Input tensor
+            layer: Layer function to apply
+            p: Probability of skipping the layer during training
+
+        Returns:
+            Output tensor (either skipped or after applying the layer)
+        """
+        if self.training and p > 0.0 and torch.rand(1).item() < p:
+            return x  # Skip the layer
+
+        out = checkpoint(layer, x, use_reentrant=False)
+        if self.training and p > 0.0:
+            keep_prob = 1.0 - p
+            if keep_prob <= 0.0:
+                return x
+            # block(x) includes the skip connection internally; only scale block(x) - x.
+            return x + (out - x) / keep_prob
+
+        return out  # Apply the layer with checkpointing
+
+
+class CheckpointedStochasticAudioEncoder(StochasticDepthMixin, AudioEncoder):
+    """
+    CheckpointedStochasticAudioEncoder, which contains stochastic depth and checkpointing, also used in the original Whisper model.
+    See: https://arxiv.org/abs/1603.09382
+    """
+
+    def __init__(
+        self,
+        n_mels: int,
+        n_ctx: int,
+        n_state: int,
+        n_head: int,
+        n_layer: int,
+        stochastic_depth_prob: float,
+    ):
+        super().__init__(n_mels, n_ctx, n_state, n_head, n_layer)
+        self.stochastic_depth_prob = stochastic_depth_prob
+
+    def forward(self, x: Tensor):
+        """
+        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+            the mel spectrogram of the audio
+        """
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
+        x = x.permute(0, 2, 1)
+
+        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+        x = (x + self.positional_embedding).to(x.dtype)
+
+        for block in self.blocks:
+            block_p = partial(block)
+            x = self.stochastic_depth(x, block_p, self.stochastic_depth_prob)
+
+        x = self.ln_post(x)
+        return x
+
+
+class CheckpointedStochasticTextDecoder(StochasticDepthMixin, TextDecoder):
+    """
+    CheckpointedStochasticTextDecoder, which contains stochastic depth and checkpointing, also used in the original Whisper model.
+    See: https://arxiv.org/abs/1603.09382
+    """
+
+    def __init__(
+        self,
+        n_vocab: int,
+        n_ctx: int,
+        n_state: int,
+        n_head: int,
+        n_layer: int,
+        stochastic_depth_prob: float,
+    ):
+        super().__init__(n_vocab, n_ctx, n_state, n_head, n_layer)
+        self.stochastic_depth_prob = stochastic_depth_prob
+
+    def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
+        """
+        x : torch.LongTensor, shape = (batch_size, <= n_ctx)
+            the text tokens
+        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
+            the encoded audio features to be attended on
+        """
+        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        x = self.token_embedding(x) + self.positional_embedding[offset : offset + x.shape[-1]]
+        x = x.to(xa.dtype)
+
+        for block in self.blocks:
+            block_p = partial(block, xa=xa, mask=self.mask, kv_cache=kv_cache)
+            x = self.stochastic_depth(x, block_p, self.stochastic_depth_prob)
+
+        x = self.ln(x)
+        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+
+        return logits
+
+
+def load_model_and_set_heads(
+    model: Whisper,
+    name: str,
+    device: Union[str, torch.device] = "cpu",
+    download_root: Optional[str] = None,
+    in_memory: bool = False,
+) -> Whisper:
+    """
+    Load a Whisper ASR model, set the alignment heads, and move the model to a device.
+
+    Parameters
+    ----------
+    name : str
+        One of the official model names listed by `whisper.available_models()`, or
+        path to a model checkpoint containing the model dimensions and the model state_dict.
+    device : Union[str, torch.device]
+        The PyTorch device to move the model to.
+    download_root: str, optional
+        Path to download the model files; by default, it uses "~/.cache/whisper".
+    in_memory: bool, optional
+        Whether to preload the model weights into host memory.
+
+    Returns
+    -------
+    model : Whisper
+        The updated Whisper model instance.
+    """
+    if download_root is None:
+        default = os.path.join(os.path.expanduser("~"), ".cache")
+        download_root = os.path.join(os.getenv("XDG_CACHE_HOME", default), "whisper")
+
+    if name in _MODELS:
+        checkpoint_file = _download(_MODELS[name], download_root, in_memory)
+        alignment_heads = _ALIGNMENT_HEADS[name]
+    elif os.path.isfile(name):
+        checkpoint_file = open(name, "rb").read() if in_memory else name
+        alignment_heads = None
+    else:
+        raise RuntimeError(f"Model {name} not found; available models = {available_models()}")
+
+    with io.BytesIO(checkpoint_file) if in_memory else open(checkpoint_file, "rb") as fp:
+        checkpoint = torch.load(fp, map_location=device)
+    del checkpoint_file
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    if alignment_heads is not None:
+        model.set_alignment_heads(alignment_heads)
+
+    return model.to(device)
+
+
+def register_deep_spec_augment_hooks(
+    model: Whisper,
+    time_mask_param: int,
+    freq_mask_param: int,
+    p: float = 1.0,
+    layer_indices: Optional[list] = None,
+) -> None:
+    p = float(p)
+    if not 0.0 <= p <= 1.0:
+        raise ValueError(f"deep_spec_augment p must be between 0 and 1, got {p}")
+
+    time_mask = T.TimeMasking(time_mask_param=time_mask_param)
+    freq_mask = T.FrequencyMasking(freq_mask_param=freq_mask_param)
+    state = {"apply": False}
+
+    def _should_apply_deep_spec_augment() -> bool:
+        if p >= 1.0:
+            return True
+        if p <= 0.0:
+            return False
+        return torch.rand(1).item() < p
+
+    def _encoder_pre_hook(module, input):
+        # Keep this decision until the next encoder forward so checkpoint
+        # recomputation uses the same DeepSpecAugment on/off state.
+        state["apply"] = _should_apply_deep_spec_augment()
+
+    def _norm_hook(module, input, output):
+        if module.training and state["apply"]:
+            # output here is normalized: shape (batch, seq_len, embed_dim)
+            # Convert to (batch, embed_dim, seq_len) for masking
+            x = output.permute(0, 2, 1)
+            x = time_mask(x)  # time masking on normalized features
+            x = freq_mask(x)  # frequency masking on normalized features
+            return x.permute(0, 2, 1)
+        return output
+
+    if layer_indices is None:
+        # Skip the final encoder block to allow the model to recover from the
+        # augmentation. ``range`` would include the last index, so we remove it
+        # here to avoid raising an error below.
+        layer_indices = range(len(model.encoder.blocks) - 1)
+
+    for idx in layer_indices:
+        if idx >= len(model.encoder.blocks):
+            raise ValueError(f"Layer index {idx} out of range")
+
+        if idx == len(model.encoder.blocks) - 1:
+            # Skip the last layer entirely
+            continue
+
+        # Register hook to the attention layer norm of each block
+        layer_norm = model.encoder.blocks[idx].attn_ln
+        layer_norm.register_forward_hook(_norm_hook)
+
+    model.encoder.register_forward_pre_hook(_encoder_pre_hook)
